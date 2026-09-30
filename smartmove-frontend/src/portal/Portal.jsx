@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { send, tryApi, jget, jset, newRows, mutate } from '../shared.js';
+import { send, tryApi, jget, jset, newRows, mutate, syncLocalTrip, withOverlay } from '../shared.js';
 
 const SK = 'sm_client_session', CK = 'sm_clients_local', TK = (id) => `sm_client_trips_${id}`;
 const STATUSES = ['', 'REQUESTED', 'SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'];
@@ -57,26 +57,53 @@ async function fetchVehicles() {
     const key = v.registration_no || v.vehicle_id;
     if (key) map.set(String(key), v);
   }
-  // Always show the complete fleet. Capacity/service checks are displayed on
-  // each vehicle card and validated when the customer confirms the booking.
-  return [...map.values()];
+  // Apply admin edits/deletions as well as newly-created vehicles so the
+  // customer always sees the same fleet state as the admin portal.
+  const fleet = [...map.values()].map((v) => ({ ...v, key: v.registration_no || v.vehicle_id }));
+  const rows = withOverlay('vehicles', fleet, 'key');
+  return rows.filter((v) => !['DELETED'].includes(String(v.status).toUpperCase()));
 }
 
 async function fetchTrips({ client, token }) {
   const cached = jget(TK(client.id), []);
   const { data } = await tryApi(() => send(`/api/clients/${client.id}/trips`, 'GET', undefined, token).then(r => r.data.trips), () => []);
-  return [...cached, ...(data || []).filter(t => !cached.some(c => c.trip_id === t.trip_id))];
+  const remote = Array.isArray(data) ? data : [];
+  const merged = [...remote, ...cached.filter(c => !remote.some(r => String(r.trip_id) === String(c.trip_id)))];
+  return merged.sort((a, b) => new Date(b.trip_date || 0) - new Date(a.trip_date || 0));
 }
 async function bookTrip({ client, token }, body) {
-  const { data } = await tryApi(() => send('/api/trips', 'POST', { ...body, client_id: client.id, passenger_id: client.id }).then(r => r.data.trip), () => null);
-  const trip = { trip_id: `REQ-${Date.now().toString().slice(-6)}`, status: 'REQUESTED', ...data, ...body, journey: `${body.pickup} → ${body.dropoff}` };
-  jset(TK(client.id), [trip, ...jget(TK(client.id), [])]); return trip;
+  const payload = {
+    ...body,
+    client_id: client.id,
+    passenger_id: client.id,
+    client_name: client.name,
+    client_email: client.email,
+    customer_name: client.name,
+  };
+  const { data } = await tryApi(() => send('/api/trips', 'POST', payload).then(r => r.data.trip), () => null);
+  const trip = {
+    trip_id: data?.trip_id || `REQ-${Date.now().toString().slice(-6)}`,
+    status: data?.status || 'REQUESTED',
+    ...data,
+    ...body,
+    client_id: client.id,
+    passenger_id: client.id,
+    client_name: client.name,
+    client_email: client.email,
+    customer_name: client.name,
+    journey: data?.journey || `${body.pickup} → ${body.dropoff}`,
+  };
+  jset(TK(client.id), [trip, ...jget(TK(client.id), [])]);
+  syncLocalTrip(trip.trip_id, trip);
+  return trip;
 }
 async function cancelTrip(session, trip) {
   const { client, token } = session;
   const { local } = await tryApi(() => send(`/api/trips/${encodeURIComponent(trip.trip_id)}`, 'PUT', { status: 'CANCELLED' }, token), () => null);
   const next = jget(TK(client.id), []).map(t => t.trip_id === trip.trip_id ? { ...t, status: 'CANCELLED' } : t);
-  jset(TK(client.id), next); return local;
+  jset(TK(client.id), next);
+  syncLocalTrip(trip.trip_id, { status: 'CANCELLED' });
+  return local;
 }
 const lookupTrip = (id) => send(`/api/trips/${encodeURIComponent(id)}`).then(r => r.data.trip);
 
@@ -101,7 +128,20 @@ function Auth({ onAuth }) {
 
 function Dash({ session, setSession }) {
   const { client } = session; const [tab,setTab]=useState('overview'); const [trips,setTrips]=useState([]); const [vehicles,setVehicles]=useState([]); const [rev,setRev]=useState(0); const [loadErr,setLoadErr]=useState('');
-  useEffect(()=>{ Promise.all([fetchTrips(session),fetchVehicles()]).then(([t,v])=>{setTrips(t);setVehicles(v);setLoadErr('');}).catch(e=>setLoadErr(e.message)); },[rev,session.client.id]);
+  useEffect(()=>{
+    let active = true;
+    const load = () => Promise.all([fetchTrips(session), fetchVehicles()]).then(([t,v])=>{
+      if (!active) return;
+      setTrips(t); setVehicles(v); setLoadErr('');
+    }).catch(e=>active && setLoadErr(e.message));
+    load();
+    const onStorage = (e) => {
+      if (e.key === 'sm_trip_sync' || e.key === 'sm_ov_vehicles' || e.key === 'sm_new_vehicles') load();
+    };
+    window.addEventListener('storage', onStorage);
+    const timer = window.setInterval(load, 15000);
+    return () => { active = false; window.removeEventListener('storage', onStorage); window.clearInterval(timer); };
+  },[rev,session.client.id]);
   const NAV=[['overview','Dashboard'],['book','Schedule a trip'],['trips','My bookings'],['profile','My profile']];
   return <div className="client-portal"><header className="portal-top"><div className="brand"><span className="mark">SM</span>SmartMove <span className="portal-label">CUSTOMER</span></div><nav className="portal-nav">{NAV.map(([id,l])=><button key={id} type="button" aria-current={tab===id?'page':undefined} onClick={()=>setTab(id)}>{l}</button>)}</nav><div className="portal-user"><span>{client.company||client.name}</span><button className="btn" type="button" onClick={()=>{setSession(null);localStorage.removeItem(SK)}}>Sign out</button></div></header>
     <main className="portal-main"><Msg>{loadErr}</Msg>{tab==='overview'&&<Overview client={client} trips={trips} vehicles={vehicles} go={setTab}/>} {tab==='book'&&<Book session={session} vehicles={vehicles} onBooked={()=>{setRev(r=>r+1);setTab('trips')}}/>} {tab==='trips'&&<MyTrips session={session} trips={trips} onChanged={()=>setRev(r=>r+1)} onBook={()=>setTab('book')}/>} {tab==='profile'&&<Profile session={session} setSession={setSession}/>}</main>

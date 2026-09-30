@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { createResource, jget, jset, mutate, newRows, removeNewRow, withOverlay } from './shared.js';
+import { allLocalTrips, createResource, jget, jset, mutate, newRows, removeNewRow, withOverlay } from './shared.js';
 import { CrudDialogs, LocalNote, RowActions } from './admin/Crud.jsx';
 
 const NAV = [['dashboard','Dashboard'],['trips','Trips'],['drivers','Drivers'],['vehicles','Vehicles'],['clients','Clients'],['reviews','Reviews'],['lookup','Lookup'],['rates','Rates']];
@@ -234,11 +234,35 @@ function TopList({ title, rows, name, id, onOpen, error }) {
   );
 }
 
+async function fetchAdminTrips(api, status, offset, limit) {
+  let remote = [];
+  let remoteError = null;
+  try {
+    remote = status
+      ? (await api(`/api/trips/status/${status}`)).data.trips || []
+      : (await api('/api/trips?limit=200&offset=0')).data.trips || [];
+  } catch (e) { remoteError = e; }
+
+  const local = allLocalTrips();
+  const merged = [...remote, ...local.filter((l) => !remote.some((r) => String(r.trip_id) === String(l.trip_id)))];
+  const filtered = status ? merged.filter((t) => String(t.status || '').toUpperCase() === status) : merged;
+  if (remoteError && !local.length) throw remoteError;
+  return filtered.slice(offset, offset + limit);
+}
+
 function Trips({ api, status, setStatus, offset, setOffset, onSelectTrip }) {
   const limit = 10;
   const [dlg, setDlg] = useState(null); const [rev, setRev] = useState(0); const [local, setLocal] = useState(false);
-  const { data, error, loading } = useLoad(() => api(status ? `/api/trips/status/${status}` : `/api/trips?limit=${limit}&offset=${offset}`).then((r) => r.data.trips), [api, status, offset, rev]);
+  const { data, error, loading } = useLoad(() => fetchAdminTrips(api, status, offset, limit), [api, status, offset, rev]);
   const trips = useMemo(() => data && withOverlay('trips', data, 'trip_id'), [data, rev]);
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key === 'sm_trip_sync' || e.key?.startsWith('sm_client_trips_')) setRev((r) => r + 1);
+    };
+    window.addEventListener('storage', onStorage);
+    const timer = window.setInterval(() => setRev((r) => r + 1), 15000);
+    return () => { window.removeEventListener('storage', onStorage); window.clearInterval(timer); };
+  }, []);
   const toInput = (d) => { const x = new Date(d); return Number.isNaN(+x) ? '' : new Date(x - x.getTimezoneOffset() * 6e4).toISOString().slice(0, 16); };
   return (
     <>
@@ -253,14 +277,16 @@ function Trips({ api, status, setStatus, offset, setOffset, onSelectTrip }) {
         <section className="card tbl" aria-live="polite">
           {loading ? <div className="empty">Loading...</div> : !trips?.length ? <div className="empty">No trips found for this filter.</div> : (
             <table>
-              <thead><tr><th>Trip</th><th>Date</th><th>Status</th><th>Driver</th><th>Vehicle</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Trip</th><th>Customer</th><th>Date</th><th>Status</th><th>Driver</th><th>Vehicle</th><th>Actions</th></tr></thead>
               <tbody>
                 {trips.map((t) => (
                   <tr key={t.trip_id} className="row" tabIndex="0" onClick={() => onSelectTrip(t.trip_id)}
                     onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onSelectTrip(t.trip_id); } }}>
-                    <td><b>{t.trip_id}</b></td><td>{formatDate(t.trip_date)}</td><td><Tag status={t.status} /></td>
-                    <td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{initials(t.driver_name)}</span>{t.driver_name}</span></td>
-                    <td>{t.vehicle_registration}</td>
+                    <td><b>{t.trip_id}</b></td>
+                    <td><div><b>{t.client_name || t.customer_name || t.client_email || t.passenger_id || '-'}</b>{t.client_email && t.client_name && <div className="meta">{t.client_email}</div>}</div></td>
+                    <td>{formatDate(t.trip_date)}</td><td><Tag status={t.status} /></td>
+                    <td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{initials(t.driver_name)}</span>{t.driver_name || 'Unassigned'}</span></td>
+                    <td>{t.vehicle_registration || 'Unassigned'}</td>
                     <RowActions onEdit={() => setDlg({ mode: 'edit', row: { ...t, trip_date: toInput(t.trip_date), label: `Trip ${t.trip_id}` } })} onDelete={() => setDlg({ mode: 'delete', row: { ...t, label: `Trip ${t.trip_id}` } })} />
                   </tr>
                 ))}
@@ -284,7 +310,14 @@ function Trips({ api, status, setStatus, offset, setOffset, onSelectTrip }) {
 }
 
 function TripDialog({ api, tripId, rates, onClose, onReview }) {
-  const { data: trip, error } = useLoad(() => api(`/api/trips/${encodeURIComponent(tripId)}`).then((r) => r.data.trip), [api, tripId]);
+  const { data: trip, error } = useLoad(async () => {
+    try { return (await api(`/api/trips/${encodeURIComponent(tripId)}`)).data.trip; }
+    catch (e) {
+      const local = allLocalTrips().find((t) => String(t.trip_id) === String(tripId));
+      if (local) return local;
+      throw e;
+    }
+  }, [api, tripId]);
   return (
     <Modal onClose={onClose}>
       {error ? <ErrorMessage message={error} /> : !trip ? 'Loading...' : (
@@ -403,20 +436,27 @@ function Clients({ api }) {
       c.n++; c.sum += Number(r.rating) || 0; if (r.is_complaint) c.complaints++;
       if (new Date(r.review_date) > new Date(c.last)) c.last = r.review_date; m.set(r.passenger_id, c);
     });
-    return [...m.values()].filter((c) => String(c.id).toLowerCase().includes(q.toLowerCase()));
+    try {
+      const clients = jget('sm_clients_local', []);
+      clients.forEach((c) => {
+        const old = m.get(c.id) || { id: c.id, n: 0, sum: 0, complaints: 0, last: null };
+        m.set(c.id, { ...old, name: c.name, email: c.email, phone: c.phone, company: c.company, client_type: c.client_type });
+      });
+    } catch { /* browser storage only */ }
+    return [...m.values()].filter((c) => `${c.id} ${c.name || ''} ${c.email || ''} ${c.company || ''}`.toLowerCase().includes(q.toLowerCase()));
   }, [data, q]);
   return (
     <>
-      <Head title="Clients">Passengers who have left reviews.</Head>
+      <Head title="Clients">Customer accounts and their bookings. Customer accounts created in this browser are also shown here.</Head>
       <div className="note">The current API has no passenger list yet, so this view is built from approved reviews. A full client directory with contact details needs a <code>/api/passengers</code> endpoint.</div>
       <div className="tools"><input className="search" aria-label="Search clients" placeholder="Search passenger ID" value={q} onChange={(e) => setQ(e.target.value)} /></div>
       {error ? <ErrorMessage message={error} /> : (
         <section className="card tbl" aria-live="polite">
           {loading ? <div className="empty">Loading...</div> : !list.length ? <div className="empty">No clients found.</div> : (
-            <table><thead><tr><th>Passenger</th><th>Reviews</th><th>Avg rating</th><th>Complaints</th><th>Last review</th></tr></thead>
+            <table><thead><tr><th>Customer</th><th>Contact</th><th>Reviews</th><th>Avg rating</th><th>Complaints</th><th>Last review</th></tr></thead>
               <tbody>{list.map((c) => (
-                <tr key={c.id}><td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{String(c.id).slice(-2)}</span><b>{c.id}</b></span></td>
-                  <td>{c.n}</td><td><Stars rating={c.sum / c.n} /> <span className="meta">{(c.sum / c.n).toFixed(1)}</span></td>
+                <tr key={c.id}><td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{initials(c.name || String(c.id))}</span><div><b>{c.name || c.id}</b><div className="meta">{c.company || c.client_type || c.id}</div></div></span></td>
+                  <td>{c.email || c.phone || '-'}</td><td>{c.n}</td><td><Stars rating={c.sum / c.n} /> <span className="meta">{(c.sum / c.n).toFixed(1)}</span></td>
                   <td>{c.complaints ? <span className="tag bad">{c.complaints}</span> : '0'}</td><td>{formatDate(c.last)}</td></tr>))}</tbody></table>
           )}
         </section>

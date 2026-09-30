@@ -35,6 +35,7 @@ export async function mutate(n, method, key, body, remoteId = key) {
   if (method === 'DELETE') o.deleted = [...new Set([...o.deleted, key])];
   else o.edits[key] = { ...o.edits[key], ...body };
   jset(`sm_ov_${n}`, o);
+  if (n === 'trips') syncLocalTrip(key, method === 'DELETE' ? null : body, method === 'DELETE');
   return local;
 }
 
@@ -56,3 +57,41 @@ export async function createResource(n, body, makeLocal) {
 
 export const newRows = (n) => jget(`sm_new_${n}`, []);
 export const removeNewRow = (n, predicate) => jset(`sm_new_${n}`, jget(`sm_new_${n}`, []).filter((r) => !predicate(r)));
+
+// Local cross-portal sync used when the backend does not expose every write/read endpoint yet.
+// This keeps the customer portal and admin portal consistent in the same browser while
+// the real API remains the source of truth whenever its endpoints are available.
+export const allLocalTrips = () => {
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith('sm_client_trips_')) continue;
+      const rows = jget(key, []);
+      if (Array.isArray(rows)) out.push(...rows);
+    }
+  } catch { /* session only */ }
+  return out;
+};
+
+export const syncLocalTrip = (tripId, patch = null, remove = false) => {
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith('sm_client_trips_')) continue;
+      const rows = jget(key, []);
+      if (!Array.isArray(rows)) continue;
+      const next = remove
+        ? rows.filter((r) => String(r.trip_id) !== String(tripId))
+        : rows.map((r) => String(r.trip_id) === String(tripId) ? { ...r, ...patch } : r);
+      jset(key, next);
+    }
+    window.dispatchEvent(new StorageEvent('storage', { key: 'sm_trip_sync', newValue: String(tripId) }));
+  } catch { /* session only */ }
+};
+
+export const localClients = () => {
+  const clients = jget('sm_clients_local', []);
+  return Array.isArray(clients) ? clients : [];
+};
+
