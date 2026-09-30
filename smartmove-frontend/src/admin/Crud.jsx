@@ -16,7 +16,6 @@ function Dlg({ onClose, children }) {
   return <dialog ref={ref} onCancel={(e) => { e.preventDefault(); onClose(); }} onClick={(e) => { if (e.target === ref.current) onClose(); }}>{children}</dialog>;
 }
 
-// dlg = { mode: 'edit' | 'delete', row }. fields = [{ name, label, type, options }]
 export function CrudDialogs({ dlg, setDlg, res, k, fields, noun, onDone }) {
   const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
   if (!dlg) return null;
@@ -29,7 +28,8 @@ export function CrudDialogs({ dlg, setDlg, res, k, fields, noun, onDone }) {
   function save(e) {
     e.preventDefault();
     const f = new FormData(e.currentTarget);
-    run('PUT', Object.fromEntries(fields.map(({ name, type }) => [name, type === 'number' ? Number(f.get(name)) : String(f.get(name)).trim()])));
+    const body = Object.fromEntries(fields.map(({ name, type }) => [name, type === 'number' ? Number(f.get(name)) : String(f.get(name)).trim()]));
+    run('PUT', body);
   }
   return (
     <Dlg onClose={close}>
@@ -45,8 +45,8 @@ export function CrudDialogs({ dlg, setDlg, res, k, fields, noun, onDone }) {
           <h2>Edit {noun}</h2>
           {fields.map(({ name, label, type = 'text', options }) => (
             <label key={name}>{label}
-              {options ? <select name={name} defaultValue={dlg.row[name]}>{options.map((o) => <option key={o}>{o}</option>)}</select>
-                : <input name={name} type={type} defaultValue={dlg.row[name]} required />}
+              {options ? <select name={name} defaultValue={dlg.row[name]}>{options.map((o) => <option key={o} value={o}>{o}</option>)}</select>
+                : <input name={name} type={type} defaultValue={dlg.row[name] ?? ''} required />}
             </label>
           ))}
           {err && <div className="msg" style={{ marginTop: 12 }}>{err}</div>}
@@ -58,5 +58,5 @@ export function CrudDialogs({ dlg, setDlg, res, k, fields, noun, onDone }) {
 }
 
 export const LocalNote = ({ on, res }) => on && (
-  <div className="note">The backend has no <code>PUT/DELETE /api/{res}/:id</code> yet, so changes are saved in this browser only.</div>
+  <div className="note">The backend does not expose the required write endpoint yet, so this change is saved in this browser. Add the matching POST/PUT/DELETE endpoint to persist it in the database.</div>
 );

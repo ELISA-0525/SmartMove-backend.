@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { withOverlay } from './shared.js';
+import { createResource, jget, jset, mutate, newRows, removeNewRow, withOverlay } from './shared.js';
 import { CrudDialogs, LocalNote, RowActions } from './admin/Crud.jsx';
 
 const NAV = [['dashboard','Dashboard'],['trips','Trips'],['drivers','Drivers'],['vehicles','Vehicles'],['clients','Clients'],['reviews','Reviews'],['lookup','Lookup'],['rates','Rates']];
@@ -308,93 +308,89 @@ function TripDialog({ api, tripId, rates, onClose, onReview }) {
   );
 }
 
+function ResourceDialog({ noun, mode, row, fields, onClose, onSubmit, onDelete }) {
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState('');
+  async function submit(e) {
+    e.preventDefault(); setBusy(true); setErr('');
+    try { const f = new FormData(e.currentTarget); const body = Object.fromEntries(fields.map(({ name, type }) => [name, type === 'number' ? Number(f.get(name)) : String(f.get(name)).trim()])); await onSubmit(body); onClose(); }
+    catch (e) { setErr(e.message); } finally { setBusy(false); }
+  }
+  return <Modal onClose={onClose}>
+    {mode === 'delete' ? <>
+      <h2>Delete {noun}?</h2><p style={{ margin: '8px 0 16px' }}><b>{row.label}</b> will be removed.</p>
+      {err && <ErrorMessage message={err} />}
+      <div className="tools"><button className="btn danger" type="button" disabled={busy} onClick={async () => { setBusy(true); try { await onDelete(); onClose(); } catch (e) { setErr(e.message); } finally { setBusy(false); } }}>{busy ? 'Deleting...' : 'Delete'}</button><button className="btn" type="button" onClick={onClose}>Cancel</button></div>
+    </> : <form onSubmit={submit}>
+      <h2>{mode === 'create' ? `Add ${noun}` : `Edit ${noun}`}</h2>
+      {fields.map(({ name, label, type='text', options, placeholder }) => <label key={name}>{label}
+        {options ? <select name={name} defaultValue={row?.[name] ?? options[0]} required>{options.map(o => <option key={o} value={o}>{o}</option>)}</select>
+          : <input name={name} type={type} defaultValue={row?.[name] ?? ''} placeholder={placeholder} required />}
+      </label>)}
+      {err && <ErrorMessage message={err} />}
+      <div className="tools" style={{ marginTop: 16 }}><button className="btn primary" type="submit" disabled={busy}>{busy ? 'Saving...' : mode === 'create' ? `Add ${noun}` : 'Save changes'}</button><button className="btn" type="button" onClick={onClose}>Cancel</button></div>
+    </form>}
+  </Modal>;
+}
+
 function Drivers({ sample, top, openLookup }) {
   const [q, setQ] = useState(''); const [dlg, setDlg] = useState(null); const [rev, setRev] = useState(0); const [local, setLocal] = useState(false);
   const list = useMemo(() => {
     const m = new Map();
     (sample.data || []).forEach((t) => {
+      if (!t.driver_name) return;
       const d = m.get(t.driver_name) || { key: t.driver_name, name: t.driver_name, trips: 0, done: 0, active: false };
-      d.trips++; if (String(t.status).toUpperCase() === 'COMPLETED') d.done++;
-      if (String(t.status).toUpperCase() === 'IN_PROGRESS') d.active = true;
-      m.set(t.driver_name, d);
+      d.trips++; if (String(t.status).toUpperCase() === 'COMPLETED') d.done++; if (String(t.status).toUpperCase() === 'IN_PROGRESS') d.active = true; m.set(t.driver_name, d);
     });
-    (top.data?.top_drivers || []).forEach((r) => {
-      const d = m.get(r.driver_name) || { key: r.driver_name, name: r.driver_name, trips: 0, done: 0, active: false };
-      Object.assign(d, { id: r.driver_id, remoteId: r.driver_id, rating: r.avg_rating, reviews: r.total_reviews }); m.set(r.driver_name, d);
-    });
-    const rows = [...m.values()].map((d) => ({ phone: '', status: d.active ? 'On a trip' : 'Available', ...d }));
-    return withOverlay('drivers', rows, 'key').filter((d) => d.name.toLowerCase().includes(q.toLowerCase())).sort((a, b) => b.trips - a.trips);
+    (top.data?.top_drivers || []).forEach((r) => { const key = r.driver_name || r.name || r.driver_id; const d = m.get(key) || { key, name: r.driver_name || r.name || `Driver ${r.driver_id}`, trips: 0, done: 0, active: false }; Object.assign(d, { id: r.driver_id, remoteId: r.driver_id, rating: r.avg_rating, reviews: r.total_reviews }); m.set(key, d); });
+    newRows('drivers').forEach((r) => { const key = r.key || r.driver_id || r.id || r.name; const old = m.get(key); m.set(key, { trips: 0, done: 0, active: false, phone: '', status: 'Available', ...old, ...r, key, name: r.name || old?.name || key }); });
+    return withOverlay('drivers', [...m.values()].map(d => ({ phone: '', status: d.active ? 'On a trip' : 'Available', ...d })), 'key').filter(d => String(d.name).toLowerCase().includes(q.toLowerCase())).sort((a,b) => b.trips-a.trips);
   }, [sample.data, top.data, q, rev]);
   const stTone = { 'On a trip': 'blue', Available: 'ok', 'On leave': 'warn', Inactive: 'bad' };
-  return (
-    <>
-      <Head title="Drivers">Drivers seen in recent trips, with ratings where passengers have reviewed them.</Head>
-      <LocalNote on={local} res="drivers" />
-      <div className="tools"><input className="search" aria-label="Search drivers" placeholder="Search drivers" value={q} onChange={(e) => setQ(e.target.value)} /></div>
-      {sample.error && <ErrorMessage message={sample.error} />}
-      {!sample.loading && !list.length && !sample.error && <div className="empty">No drivers match.</div>}
-      {!!list.length && (
-        <section className="card tbl">
-          <table>
-            <thead><tr><th>Driver</th><th>Phone</th><th>Status</th><th>Trips</th><th>Completed</th><th>Rating</th><th>Actions</th></tr></thead>
-            <tbody>{list.map((d) => (
-              <tr key={d.key}>
-                <td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{initials(d.name)}</span>
-                  {d.id ? <button className="chip" style={{ padding: '2px 10px' }} onClick={() => openLookup('driver', d.id)}>{d.name}</button> : <b>{d.name}</b>}</span></td>
-                <td>{d.phone || '-'}</td><td><span className={`tag ${stTone[d.status] || ''}`}>{d.status}</span></td>
-                <td>{d.trips ?? 0}</td><td>{d.trips ? Math.round((d.done / d.trips) * 100) : 0}%</td><td>{d.rating ? Number(d.rating).toFixed(1) : '-'}</td>
-                <RowActions onEdit={() => setDlg({ mode: 'edit', row: { ...d, label: d.name } })} onDelete={() => setDlg({ mode: 'delete', row: { ...d, label: d.name } })} />
-              </tr>))}</tbody>
-          </table>
-        </section>
-      )}
-      <CrudDialogs key={dlg ? `${dlg.mode}-${dlg.row.key}` : 'x'} dlg={dlg} setDlg={setDlg} res="drivers" k="key" noun="driver"
-        fields={[{ name: 'name', label: 'Full name' }, { name: 'phone', label: 'Phone', type: 'tel' }, { name: 'status', label: 'Status', options: ['Available', 'On a trip', 'On leave', 'Inactive'] }]}
-        onDone={(l) => { setLocal(l); setRev((r) => r + 1); }} />
-    </>
-  );
+  async function add(body) {
+    const key = body.driver_id || body.id || body.name;
+    const result = await createResource('drivers', { ...body, driver_id: body.driver_id || undefined }, () => ({ ...body, key, id: `D-${Date.now()}`, driver_id: `D-${Date.now()}` }));
+    setLocal(result.local); setRev(x => x + 1);
+  }
+  async function del(row) {
+    if (row.localOnly || newRows('drivers').some(r => (r.key || r.driver_id || r.id || r.name) === row.key)) { removeNewRow('drivers', r => (r.key || r.driver_id || r.id || r.name) === row.key); const o = jget('sm_ov_drivers', { edits:{}, deleted:[] }); o.deleted=[...new Set([...(o.deleted||[]), row.key])]; jset('sm_ov_drivers', o); setRev(x=>x+1); return; }
+    const isLocal = await mutate('drivers', 'DELETE', row.key, undefined, row.remoteId); setLocal(isLocal); setRev(x=>x+1);
+  }
+  return <>
+    <Head title="Drivers">Manage drivers, contact details and availability for your fleet.</Head>
+    <div className="tools"><input className="search" aria-label="Search drivers" placeholder="Search drivers" value={q} onChange={e=>setQ(e.target.value)} /><button className="btn primary" type="button" onClick={()=>setDlg({mode:'create',row:{status:'Available'}})}>+ Add driver</button></div>
+    <LocalNote on={local} res="drivers" />
+    {sample.error && <ErrorMessage message={sample.error} />}
+    {!sample.loading && !list.length && !sample.error && <div className="empty">No drivers yet. Use <b>+ Add driver</b> to create the first driver.</div>}
+    {!!list.length && <section className="card tbl"><table><thead><tr><th>Driver</th><th>Phone</th><th>Status</th><th>Trips</th><th>Completed</th><th>Rating</th><th>Actions</th></tr></thead><tbody>{list.map(d=><tr key={d.key}>
+      <td><span className="row2"><span className="avatar" style={{width:30,height:30,fontSize:12}}>{initials(d.name)}</span>{d.id ? <button className="chip" style={{padding:'2px 10px'}} onClick={()=>openLookup('driver',d.id)}>{d.name}</button> : <b>{d.name}</b>}</span></td>
+      <td>{d.phone || '-'}</td><td><span className={`tag ${stTone[d.status]||''}`}>{d.status}</span></td><td>{d.trips||0}</td><td>{d.trips?Math.round((d.done/d.trips)*100):0}%</td><td>{d.rating?Number(d.rating).toFixed(1):'-'}</td>
+      <RowActions onEdit={()=>setDlg({mode:'edit',row:{...d,label:d.name}})} onDelete={()=>setDlg({mode:'delete',row:{...d,label:d.name}})} />
+    </tr>)}</tbody></table></section>}
+    {dlg && <ResourceDialog noun="driver" mode={dlg.mode} row={dlg.row} fields={[{name:'name',label:'Full name',placeholder:'e.g. Kasun Perera'},{name:'phone',label:'Phone',type:'tel',placeholder:'07X XXX XXXX'},{name:'status',label:'Status',options:['Available','On a trip','On leave','Inactive']}]} onClose={()=>setDlg(null)} onSubmit={async body=>{ if(dlg.mode==='create') await add(body); else { const l=await mutate('drivers','PUT',dlg.row.key,body,dlg.row.remoteId); setLocal(l); setRev(x=>x+1); } }} onDelete={()=>del(dlg.row)} />}
+  </>;
 }
 
 function Vehicles({ sample, top, rates }) {
   const [q, setQ] = useState(''); const [dlg, setDlg] = useState(null); const [rev, setRev] = useState(0); const [local, setLocal] = useState(false);
   const list = useMemo(() => {
     const m = new Map();
-    (sample.data || []).forEach((t) => {
-      const v = m.get(t.vehicle_registration) || { key: t.vehicle_registration, reg: t.vehicle_registration, seats: t.seat_capacity, trips: 0, active: false, next: false };
-      v.trips++; const st = String(t.status).toUpperCase();
-      if (st === 'IN_PROGRESS') v.active = true; if (st === 'SCHEDULED') v.next = true; m.set(t.vehicle_registration, v);
-    });
-    (top.data?.top_vehicles || []).forEach((r) => { const v = m.get(r.registration_no); if (v) { v.rating = r.avg_rating; v.remoteId = r.vehicle_id; } });
-    const rows = [...m.values()].map((v) => ({ status: v.active ? 'In service' : v.next ? 'Scheduled' : 'Idle', ...v }));
-    return withOverlay('vehicles', rows, 'key').filter((v) => v.reg.toLowerCase().includes(q.toLowerCase()));
+    (sample.data || []).forEach(t => { if(!t.vehicle_registration) return; const v=m.get(t.vehicle_registration)||{key:t.vehicle_registration,reg:t.vehicle_registration,seats:t.seat_capacity,trips:0,active:false,next:false}; v.trips++; const st=String(t.status).toUpperCase(); if(st==='IN_PROGRESS')v.active=true; if(st==='SCHEDULED')v.next=true; m.set(t.vehicle_registration,v); });
+    (top.data?.top_vehicles || []).forEach(r=>{const key=r.registration_no||r.registration||r.reg; const v=m.get(key)||{key,reg:key,seats:r.seat_capacity||r.seats,trips:0,active:false,next:false}; Object.assign(v,{id:r.vehicle_id,remoteId:r.vehicle_id,rating:r.avg_rating}); m.set(key,v);});
+    newRows('vehicles').forEach(r=>{const key=r.key||r.registration_no||r.registration||r.reg||r.id; const old=m.get(key); m.set(key,{trips:0,active:false,next:false,status:'Idle',...old,...r,key,reg:r.reg||r.registration||r.registration_no||old?.reg||key,seats:Number(r.seats||r.seat_capacity||old?.seats||0)});});
+    return withOverlay('vehicles',[...m.values()].map(v=>({status:v.active?'In service':v.next?'Scheduled':(v.status||'Idle'),...v})), 'key').filter(v=>String(v.reg).toLowerCase().includes(q.toLowerCase()));
   }, [sample.data, top.data, q, rev]);
-  const stTone = { 'In service': 'blue', Scheduled: 'warn', Idle: 'ok', Maintenance: 'bad' };
-  return (
-    <>
-      <Head title="Vehicles">Fleet seen in recent trips. Rates come from your rate card.</Head>
-      <LocalNote on={local} res="vehicles" />
-      <div className="tools"><input className="search" aria-label="Search vehicles" placeholder="Search registration" value={q} onChange={(e) => setQ(e.target.value)} /></div>
-      {sample.error && <ErrorMessage message={sample.error} />}
-      {!sample.loading && !list.length && !sample.error && <div className="empty">No vehicles match.</div>}
-      {!!list.length && (
-        <section className="card tbl">
-          <table>
-            <thead><tr><th>Registration</th><th>Type</th><th>Seats</th><th>Status</th><th>Trips</th><th>Per km</th><th>Rating</th><th>Actions</th></tr></thead>
-            <tbody>{list.map((v) => { const t = vType(v.seats); return (
-              <tr key={v.key}>
-                <td><b>{v.reg}</b></td><td>{t === 'BUS' ? 'Bus' : 'Van'}</td><td>{v.seats}</td>
-                <td><span className={`tag ${stTone[v.status] || ''}`}>{v.status}</span></td>
-                <td>{v.trips}</td><td>{lkr(rates[t])}</td><td>{v.rating ? Number(v.rating).toFixed(1) : '-'}</td>
-                <RowActions onEdit={() => setDlg({ mode: 'edit', row: { ...v, label: v.reg } })} onDelete={() => setDlg({ mode: 'delete', row: { ...v, label: v.reg } })} />
-              </tr>); })}</tbody>
-          </table>
-        </section>
-      )}
-      <CrudDialogs key={dlg ? `${dlg.mode}-${dlg.row.key}` : 'x'} dlg={dlg} setDlg={setDlg} res="vehicles" k="key" noun="vehicle"
-        fields={[{ name: 'reg', label: 'Registration' }, { name: 'seats', label: 'Seats', type: 'number' }, { name: 'status', label: 'Status', options: ['In service', 'Scheduled', 'Idle', 'Maintenance'] }]}
-        onDone={(l) => { setLocal(l); setRev((r) => r + 1); }} />
-    </>
-  );
+  const stTone={ 'In service':'blue',Scheduled:'warn',Idle:'ok',Maintenance:'bad' };
+  async function add(body){const key=body.reg; const result=await createResource('vehicles',{...body,registration_no:body.reg,seat_capacity:Number(body.seats)},()=>({ ...body,key,id:`V-${Date.now()}`,vehicle_id:`V-${Date.now()}`,registration_no:body.reg,registration:body.reg,seat_capacity:Number(body.seats),reg:body.reg,localOnly:true })); setLocal(result.local); setRev(x=>x+1);}
+  async function del(row){if(row.localOnly||newRows('vehicles').some(r=>(r.key||r.registration_no||r.registration||r.reg||r.id)===row.key)){removeNewRow('vehicles',r=>(r.key||r.registration_no||r.registration||r.reg||r.id)===row.key); const o=jget('sm_ov_vehicles',{edits:{},deleted:[]}); o.deleted=[...new Set([...(o.deleted||[]),row.key])]; jset('sm_ov_vehicles',o); setRev(x=>x+1); return;} const isLocal=await mutate('vehicles','DELETE',row.key,undefined,row.remoteId); setLocal(isLocal); setRev(x=>x+1);}
+  return <>
+    <Head title="Vehicles">Manage registrations, capacity, service status and fleet availability.</Head>
+    <div className="tools"><input className="search" aria-label="Search vehicles" placeholder="Search registration" value={q} onChange={e=>setQ(e.target.value)} /><button className="btn primary" type="button" onClick={()=>setDlg({mode:'create',row:{status:'Idle',seats:12}})}>+ Add vehicle</button></div>
+    <LocalNote on={local} res="vehicles" />
+    {sample.error && <ErrorMessage message={sample.error} />}
+    {!sample.loading && !list.length && !sample.error && <div className="empty">No vehicles yet. Use <b>+ Add vehicle</b> to create the first vehicle.</div>}
+    {!!list.length && <section className="card tbl"><table><thead><tr><th>Registration</th><th>Type</th><th>Seats</th><th>Status</th><th>Trips</th><th>Per km</th><th>Rating</th><th>Actions</th></tr></thead><tbody>{list.map(v=>{const t=vType(v.seats);return <tr key={v.key}><td><b>{v.reg}</b></td><td>{t==='BUS'?'Bus':'Van'}</td><td>{v.seats}</td><td><span className={`tag ${stTone[v.status]||''}`}>{v.status}</span></td><td>{v.trips}</td><td>{lkr(rates[t])}</td><td>{v.rating?Number(v.rating).toFixed(1):'-'}</td><RowActions onEdit={()=>setDlg({mode:'edit',row:{...v,reg:v.reg,seats:v.seats,label:v.reg}})} onDelete={()=>setDlg({mode:'delete',row:{...v,label:v.reg}})} /></tr>})}</tbody></table></section>}
+    {dlg && <ResourceDialog noun="vehicle" mode={dlg.mode} row={dlg.row} fields={[{name:'reg',label:'Registration',placeholder:'e.g. WP CAA-1234'},{name:'seats',label:'Seat capacity',type:'number',placeholder:'12'},{name:'status',label:'Status',options:['Idle','In service','Scheduled','Maintenance']}]} onClose={()=>setDlg(null)} onSubmit={async body=>{ if(dlg.mode==='create') await add(body); else { const l=await mutate('vehicles','PUT',dlg.row.key,{...body,registration_no:body.reg,seat_capacity:Number(body.seats)},dlg.row.remoteId); setLocal(l); setRev(x=>x+1); } }} onDelete={()=>del(dlg.row)} />}
+  </>;
 }
 
 function Clients({ api }) {
