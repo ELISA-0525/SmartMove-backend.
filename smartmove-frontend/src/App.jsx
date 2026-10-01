@@ -428,36 +428,97 @@ function Vehicles({ sample, top, rates }) {
 
 function Clients({ api }) {
   const [q, setQ] = useState('');
-  const { data, error, loading } = useLoad(() => api('/api/reviews?page=1&limit=100').then((r) => r.data.reviews), [api]);
+
+  const { data, error, loading } = useLoad(
+    () =>
+      api('/api/passengers').then((r) => r.data?.passengers || []),
+    [api]
+  );
+
   const list = useMemo(() => {
-    const m = new Map();
-    (data || []).forEach((r) => {
-      const c = m.get(r.passenger_id) || { id: r.passenger_id, n: 0, sum: 0, complaints: 0, last: r.review_date };
-      c.n++; c.sum += Number(r.rating) || 0; if (r.is_complaint) c.complaints++;
-      if (new Date(r.review_date) > new Date(c.last)) c.last = r.review_date; m.set(r.passenger_id, c);
-    });
-    try {
-      const clients = jget('sm_clients_local', []);
-      clients.forEach((c) => {
-        const old = m.get(c.id) || { id: c.id, n: 0, sum: 0, complaints: 0, last: null };
-        m.set(c.id, { ...old, name: c.name, email: c.email, phone: c.phone, company: c.company, client_type: c.client_type });
-      });
-    } catch { /* browser storage only */ }
-    return [...m.values()].filter((c) => `${c.id} ${c.name || ''} ${c.email || ''} ${c.company || ''}`.toLowerCase().includes(q.toLowerCase()));
+    return (data || []).filter((c) =>
+      `${c.passenger_id || ''} ${c.name || ''} ${c.email || ''} ${c.phone || ''} ${c.passenger_type || ''}`
+        .toLowerCase()
+        .includes(q.toLowerCase())
+    );
   }, [data, q]);
+
   return (
     <>
-      <Head title="Clients">Customer accounts and their bookings. Customer accounts created in this browser are also shown here.</Head>
-      <div className="note">The current API has no passenger list yet, so this view is built from approved reviews. A full client directory with contact details needs a <code>/api/passengers</code> endpoint.</div>
-      <div className="tools"><input className="search" aria-label="Search clients" placeholder="Search passenger ID" value={q} onChange={(e) => setQ(e.target.value)} /></div>
-      {error ? <ErrorMessage message={error} /> : (
+      <Head title="Clients">
+        Registered passengers from the SmartMove passenger database.
+      </Head>
+
+      <div className="tools">
+        <input
+          className="search"
+          aria-label="Search clients"
+          placeholder="Search passenger ID, name, email or phone"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+      </div>
+
+      {error ? (
+        <ErrorMessage message={error} />
+      ) : (
         <section className="card tbl" aria-live="polite">
-          {loading ? <div className="empty">Loading...</div> : !list.length ? <div className="empty">No clients found.</div> : (
-            <table><thead><tr><th>Customer</th><th>Contact</th><th>Reviews</th><th>Avg rating</th><th>Complaints</th><th>Last review</th></tr></thead>
-              <tbody>{list.map((c) => (
-                <tr key={c.id}><td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{initials(c.name || String(c.id))}</span><div><b>{c.name || c.id}</b><div className="meta">{c.company || c.client_type || c.id}</div></div></span></td>
-                  <td>{c.email || c.phone || '-'}</td><td>{c.n}</td><td><Stars rating={c.sum / c.n} /> <span className="meta">{(c.sum / c.n).toFixed(1)}</span></td>
-                  <td>{c.complaints ? <span className="tag bad">{c.complaints}</span> : '0'}</td><td>{formatDate(c.last)}</td></tr>))}</tbody></table>
+          {loading ? (
+            <div className="empty">Loading passengers...</div>
+          ) : !list.length ? (
+            <div className="empty">No passengers found.</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Passenger</th>
+                  <th>Contact</th>
+                  <th>Type</th>
+                  <th>Registered</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {list.map((c) => (
+                  <tr key={c.passenger_id}>
+                    <td>
+                      <span className="row2">
+                        <span
+                          className="avatar"
+                          style={{
+                            width: 30,
+                            height: 30,
+                            fontSize: 12,
+                          }}
+                        >
+                          {initials(c.name || String(c.passenger_id))}
+                        </span>
+
+                        <div>
+                          <b>{c.name || c.passenger_id}</b>
+                          <div className="meta">
+                            {c.passenger_id}
+                          </div>
+                        </div>
+                      </span>
+                    </td>
+
+                    <td>
+                      <div>{c.email || '-'}</div>
+                      <div className="meta">{c.phone || '-'}</div>
+                    </td>
+
+                    <td>
+                      {c.passenger_type || '-'}
+                    </td>
+
+                    <td>
+                      {formatDate(c.registered_date)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           )}
         </section>
       )}
