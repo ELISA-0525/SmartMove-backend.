@@ -250,6 +250,41 @@ async function fetchAdminTrips(api, status, offset, limit) {
   return filtered.slice(offset, offset + limit);
 }
 
+function downloadTripsReport(tripsList, activeFilter = '') {
+  if (!tripsList || !tripsList.length) {
+    alert('No trips available to download.');
+    return;
+  }
+  const headers = ['Trip ID', 'Customer', 'Date & Time', 'Status', 'Driver', 'Vehicle', 'Seat Capacity', 'Trip Type'];
+  const rows = tripsList.map((t) => [
+    t.trip_id || '',
+    t.client_name || t.customer_name || t.client_email || t.passenger_id || 'Unassigned',
+    t.trip_date ? new Date(t.trip_date).toLocaleString() : '',
+    t.status || '',
+    t.driver_name || 'Unassigned',
+    t.vehicle_registration || 'Unassigned',
+    t.seat_capacity || '',
+    (t.trip_type || '').replace('_', ' ')
+  ]);
+
+  const csvContent = [
+    headers.map((h) => `"${h.replace(/"/g, '""')}"`).join(','),
+    ...rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+  ].join('\r\n');
+
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const filterSuffix = activeFilter ? `_${activeFilter.toLowerCase()}` : '';
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `smartmove_trips_report${filterSuffix}_${dateStr}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function Trips({ api, status, setStatus, offset, setOffset, onSelectTrip }) {
   const limit = 10;
   const [dlg, setDlg] = useState(null); const [rev, setRev] = useState(0); const [local, setLocal] = useState(false);
@@ -272,6 +307,16 @@ function Trips({ api, status, setStatus, offset, setOffset, onSelectTrip }) {
         {TRIP_STATUSES.map((v) => (
           <button key={v || 'all'} className="chip" type="button" aria-pressed={status === v} onClick={() => setStatus(v)}>{v ? v.replace('_', ' ') : 'All'}</button>
         ))}
+        <button
+          className="btn"
+          type="button"
+          style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+          onClick={() => downloadTripsReport(trips, status)}
+          disabled={!trips?.length}
+          title="Download trips report as CSV"
+        >
+          📥 Download report
+        </button>
       </div>
       {error ? <ErrorMessage message={error} /> : (
         <section className="card tbl" aria-live="polite">
@@ -365,64 +410,264 @@ function ResourceDialog({ noun, mode, row, fields, onClose, onSubmit, onDelete }
   </Modal>;
 }
 
-function Drivers({ sample, top, openLookup }) {
-  const [q, setQ] = useState(''); const [dlg, setDlg] = useState(null); const [rev, setRev] = useState(0); const [local, setLocal] = useState(false);
+function Drivers({ sample, top, openLookup, api }) {
+  const [q, setQ] = useState('');
+  const [dlg, setDlg] = useState(null);
+  const [refresh, setRefresh] = useState(0);
+  const [local, setLocal] = useState(false);
+
+  // Clear stale overlay deleted lists — API is now the source of truth
+  useEffect(() => { jset('sm_ov_drivers', { edits: {}, deleted: [] }); }, []);
+
+  // Fetch directly from /api/drivers so newly added drivers show immediately
+  const driversLoad = useLoad(
+    () => api('/api/drivers').then(r => r.data?.drivers || []),
+    [api, refresh]
+  );
+
   const list = useMemo(() => {
     const m = new Map();
-    (sample.data || []).forEach((t) => {
-      if (!t.driver_name) return;
-      const d = m.get(t.driver_name) || { key: t.driver_name, name: t.driver_name, trips: 0, done: 0, active: false };
-      d.trips++; if (String(t.status).toUpperCase() === 'COMPLETED') d.done++; if (String(t.status).toUpperCase() === 'IN_PROGRESS') d.active = true; m.set(t.driver_name, d);
+
+    // Layer 1: from dedicated /api/drivers endpoint
+    (driversLoad.data || []).forEach(d => {
+      const key = d.driver_id || d.name;
+      m.set(key, { trips: 0, done: 0, active: false, ...d, key, name: d.name, id: d.driver_id, remoteId: d.driver_id });
     });
-    (top.data?.top_drivers || []).forEach((r) => { const key = r.driver_name || r.name || r.driver_id; const d = m.get(key) || { key, name: r.driver_name || r.name || `Driver ${r.driver_id}`, trips: 0, done: 0, active: false }; Object.assign(d, { id: r.driver_id, remoteId: r.driver_id, rating: r.avg_rating, reviews: r.total_reviews }); m.set(key, d); });
-    newRows('drivers').forEach((r) => { const key = r.key || r.driver_id || r.id || r.name; const old = m.get(key); m.set(key, { trips: 0, done: 0, active: false, phone: '', status: 'Available', ...old, ...r, key, name: r.name || old?.name || key }); });
-    return withOverlay('drivers', [...m.values()].map(d => ({ phone: '', status: d.active ? 'On a trip' : 'Available', ...d })), 'key').filter(d => String(d.name).toLowerCase().includes(q.toLowerCase())).sort((a,b) => b.trips-a.trips);
-  }, [sample.data, top.data, q, rev]);
+
+    // Layer 2: trip counts from sample data
+    (sample.data || []).forEach(t => {
+      if (!t.driver_name) return;
+      // find by name
+      let found = null;
+      for (const [k, v] of m.entries()) { if (v.name === t.driver_name) { found = k; break; } }
+      const key = found || t.driver_name;
+      const d = m.get(key) || { key, name: t.driver_name, trips: 0, done: 0, active: false };
+      d.trips = (d.trips || 0) + 1;
+      if (String(t.status).toUpperCase() === 'COMPLETED') d.done = (d.done || 0) + 1;
+      if (String(t.status).toUpperCase() === 'IN_PROGRESS') d.active = true;
+      m.set(key, d);
+    });
+
+    // Layer 3: ratings from top_drivers
+    (top.data?.top_drivers || []).forEach(r => {
+      const key = r.driver_id || r.driver_name || r.name;
+      const d = m.get(key) || { key, name: r.driver_name || r.name || `Driver ${r.driver_id}`, trips: 0, done: 0, active: false };
+      Object.assign(d, { id: r.driver_id, remoteId: r.driver_id, rating: r.avg_rating, reviews: r.total_reviews });
+      m.set(key, d);
+    });
+
+    // Layer 4: local-only rows (saved while offline)
+    newRows('drivers').forEach(r => {
+      const key = r.key || r.driver_id || r.id || r.name;
+      if (!m.has(key)) {
+        m.set(key, { trips: 0, done: 0, active: false, phone: '', status: 'Available', ...r, key, name: r.name || key });
+      }
+    });
+
+    // Convert Oracle DB status values to display labels
+    const driverDisplayStatus = (d) => {
+      if (d.active) return 'On a trip';
+      const s = String(d.status || '').toUpperCase();
+      if (s === 'ON_LEAVE' || s === 'ON LEAVE') return 'On leave';
+      if (s === 'INACTIVE') return 'Inactive';
+      return 'Available'; // ACTIVE or anything else
+    };
+
+    // API is source of truth — no overlay filtering needed
+    return [...m.values()]
+      .map(d => ({ ...d, phone: d.phone || '', status: driverDisplayStatus(d) }))
+      .filter(d => String(d.name).toLowerCase().includes(q.toLowerCase()))
+      .sort((a, b) => b.trips - a.trips);
+  }, [driversLoad.data, sample.data, top.data, q]);
+
   const stTone = { 'On a trip': 'blue', Available: 'ok', 'On leave': 'warn', Inactive: 'bad' };
+
   async function add(body) {
     const key = body.driver_id || body.id || body.name;
-    const result = await createResource('drivers', { ...body, driver_id: body.driver_id || undefined }, () => ({ ...body, key, id: `D-${Date.now()}`, driver_id: `D-${Date.now()}` }));
-    setLocal(result.local); setRev(x => x + 1);
+    const licenseNumber = body.license_number || body.license || `B${Math.floor(1000000 + Math.random() * 9000000)}`;
+    const result = await createResource('drivers',
+      { ...body, license_number: licenseNumber, driver_id: body.driver_id || undefined },
+      () => ({ ...body, license_number: licenseNumber, key, id: key, driver_id: key, localOnly: true })
+    );
+    setLocal(result.local);
+    setRefresh(x => x + 1); // re-fetch from API
   }
+
   async function del(row) {
-    if (row.localOnly || newRows('drivers').some(r => (r.key || r.driver_id || r.id || r.name) === row.key)) { removeNewRow('drivers', r => (r.key || r.driver_id || r.id || r.name) === row.key); const o = jget('sm_ov_drivers', { edits:{}, deleted:[] }); o.deleted=[...new Set([...(o.deleted||[]), row.key])]; jset('sm_ov_drivers', o); setRev(x=>x+1); return; }
-    const isLocal = await mutate('drivers', 'DELETE', row.key, undefined, row.remoteId); setLocal(isLocal); setRev(x=>x+1);
+    if (row.localOnly || newRows('drivers').some(r => (r.key || r.driver_id || r.id || r.name) === row.key)) {
+      removeNewRow('drivers', r => (r.key || r.driver_id || r.id || r.name) === row.key);
+      const o = jget('sm_ov_drivers', { edits: {}, deleted: [] });
+      o.deleted = [...new Set([...(o.deleted || []), row.key])];
+      jset('sm_ov_drivers', o);
+      setRefresh(x => x + 1);
+      return;
+    }
+    const isLocal = await mutate('drivers', 'DELETE', row.key, undefined, row.remoteId);
+    setLocal(isLocal);
+    setRefresh(x => x + 1);
   }
+
+  const loading = driversLoad.loading;
+  const error = driversLoad.error || sample.error;
+
   return <>
     <Head title="Drivers">Manage drivers, contact details and availability for your fleet.</Head>
-    <div className="tools"><input className="search" aria-label="Search drivers" placeholder="Search drivers" value={q} onChange={e=>setQ(e.target.value)} /><button className="btn primary" type="button" onClick={()=>setDlg({mode:'create',row:{status:'Available'}})}>+ Add driver</button></div>
+    <div className="tools">
+      <input className="search" aria-label="Search drivers" placeholder="Search drivers" value={q} onChange={e => setQ(e.target.value)} />
+      <button className="btn primary" type="button" onClick={() => setDlg({ mode: 'create', row: { status: 'Available' } })}>+ Add driver</button>
+    </div>
     <LocalNote on={local} res="drivers" />
-    {sample.error && <ErrorMessage message={sample.error} />}
-    {!sample.loading && !list.length && !sample.error && <div className="empty">No drivers yet. Use <b>+ Add driver</b> to create the first driver.</div>}
-    {!!list.length && <section className="card tbl"><table><thead><tr><th>Driver</th><th>Phone</th><th>Status</th><th>Trips</th><th>Completed</th><th>Rating</th><th>Actions</th></tr></thead><tbody>{list.map(d=><tr key={d.key}>
-      <td><span className="row2"><span className="avatar" style={{width:30,height:30,fontSize:12}}>{initials(d.name)}</span>{d.id ? <button className="chip" style={{padding:'2px 10px'}} onClick={()=>openLookup('driver',d.id)}>{d.name}</button> : <b>{d.name}</b>}</span></td>
-      <td>{d.phone || '-'}</td><td><span className={`tag ${stTone[d.status]||''}`}>{d.status}</span></td><td>{d.trips||0}</td><td>{d.trips?Math.round((d.done/d.trips)*100):0}%</td><td>{d.rating?Number(d.rating).toFixed(1):'-'}</td>
-      <RowActions onEdit={()=>setDlg({mode:'edit',row:{...d,label:d.name}})} onDelete={()=>setDlg({mode:'delete',row:{...d,label:d.name}})} />
+    {error && <ErrorMessage message={error} />}
+    {loading && <div className="empty">Loading drivers...</div>}
+    {!loading && !list.length && !error && <div className="empty">No drivers yet. Use <b>+ Add driver</b> to create the first driver.</div>}
+    {!loading && !!list.length && <section className="card tbl"><table><thead><tr><th>Driver</th><th>Phone</th><th>Status</th><th>Trips</th><th>Completed</th><th>Rating</th><th>Actions</th></tr></thead><tbody>{list.map(d => <tr key={d.key}>
+      <td><span className="row2"><span className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>{initials(d.name)}</span>{d.id ? <button className="chip" style={{ padding: '2px 10px' }} onClick={() => openLookup('driver', d.id)}>{d.name}</button> : <b>{d.name}</b>}</span></td>
+      <td>{d.phone || '-'}</td><td><span className={`tag ${stTone[d.status] || ''}`}>{d.status}</span></td><td>{d.trips || 0}</td><td>{d.trips ? Math.round((d.done / d.trips) * 100) : 0}%</td><td>{d.rating ? Number(d.rating).toFixed(1) : '-'}</td>
+      <RowActions onEdit={() => setDlg({ mode: 'edit', row: { ...d, label: d.name } })} onDelete={() => setDlg({ mode: 'delete', row: { ...d, label: d.name } })} />
     </tr>)}</tbody></table></section>}
-    {dlg && <ResourceDialog noun="driver" mode={dlg.mode} row={dlg.row} fields={[{name:'name',label:'Full name',placeholder:'e.g. Kasun Perera'},{name:'phone',label:'Phone',type:'tel',placeholder:'07X XXX XXXX'},{name:'status',label:'Status',options:['Available','On a trip','On leave','Inactive']}]} onClose={()=>setDlg(null)} onSubmit={async body=>{ if(dlg.mode==='create') await add(body); else { const l=await mutate('drivers','PUT',dlg.row.key,body,dlg.row.remoteId); setLocal(l); setRev(x=>x+1); } }} onDelete={()=>del(dlg.row)} />}
+    {dlg && <ResourceDialog noun="driver" mode={dlg.mode} row={dlg.row} fields={[{ name: 'name', label: 'Full name', placeholder: 'e.g. Kasun Perera' }, { name: 'license_number', label: 'License number', placeholder: 'e.g. B1234567' }, { name: 'phone', label: 'Phone', type: 'tel', placeholder: '07X XXX XXXX' }, { name: 'status', label: 'Status', options: ['Available', 'On a trip', 'On leave', 'Inactive'] }]} onClose={() => setDlg(null)} onSubmit={async body => { if (dlg.mode === 'create') await add(body); else { const l = await mutate('drivers', 'PUT', dlg.row.key, body, dlg.row.remoteId); setLocal(l); setRefresh(x => x + 1); } }} onDelete={() => del(dlg.row)} />}
   </>;
 }
 
-function Vehicles({ sample, top, rates }) {
-  const [q, setQ] = useState(''); const [dlg, setDlg] = useState(null); const [rev, setRev] = useState(0); const [local, setLocal] = useState(false);
+function Vehicles({ sample, top, rates, api }) {
+  const [q, setQ] = useState('');
+  const [dlg, setDlg] = useState(null);
+  const [refresh, setRefresh] = useState(0);
+  const [local, setLocal] = useState(false);
+
+  // Clear stale overlay deleted lists — API is now the source of truth
+  useEffect(() => { jset('sm_ov_vehicles', { edits: {}, deleted: [] }); }, []);
+
+  // Fetch directly from /api/vehicles so newly added vehicles show immediately
+  const vehiclesLoad = useLoad(
+    () => api('/api/vehicles').then(r => r.data?.vehicles || []),
+    [api, refresh]
+  );
+
   const list = useMemo(() => {
     const m = new Map();
-    (sample.data || []).forEach(t => { if(!t.vehicle_registration) return; const v=m.get(t.vehicle_registration)||{key:t.vehicle_registration,reg:t.vehicle_registration,seats:t.seat_capacity,trips:0,active:false,next:false}; v.trips++; const st=String(t.status).toUpperCase(); if(st==='IN_PROGRESS')v.active=true; if(st==='SCHEDULED')v.next=true; m.set(t.vehicle_registration,v); });
-    (top.data?.top_vehicles || []).forEach(r=>{const key=r.registration_no||r.registration||r.reg; const v=m.get(key)||{key,reg:key,seats:r.seat_capacity||r.seats,trips:0,active:false,next:false}; Object.assign(v,{id:r.vehicle_id,remoteId:r.vehicle_id,rating:r.avg_rating}); m.set(key,v);});
-    newRows('vehicles').forEach(r=>{const key=r.key||r.registration_no||r.registration||r.reg||r.id; const old=m.get(key); m.set(key,{trips:0,active:false,next:false,status:'Idle',...old,...r,key,reg:r.reg||r.registration||r.registration_no||old?.reg||key,seats:Number(r.seats||r.seat_capacity||old?.seats||0)});});
-    return withOverlay('vehicles',[...m.values()].map(v=>({status:v.active?'In service':v.next?'Scheduled':(v.status||'Idle'),...v})), 'key').filter(v=>String(v.reg).toLowerCase().includes(q.toLowerCase()));
-  }, [sample.data, top.data, q, rev]);
-  const stTone={ 'In service':'blue',Scheduled:'warn',Idle:'ok',Maintenance:'bad' };
-  async function add(body){const key=body.reg; const result=await createResource('vehicles',{...body,registration_no:body.reg,seat_capacity:Number(body.seats)},()=>({ ...body,key,id:`V-${Date.now()}`,vehicle_id:`V-${Date.now()}`,registration_no:body.reg,registration:body.reg,seat_capacity:Number(body.seats),reg:body.reg,localOnly:true })); setLocal(result.local); setRev(x=>x+1);}
-  async function del(row){if(row.localOnly||newRows('vehicles').some(r=>(r.key||r.registration_no||r.registration||r.reg||r.id)===row.key)){removeNewRow('vehicles',r=>(r.key||r.registration_no||r.registration||r.reg||r.id)===row.key); const o=jget('sm_ov_vehicles',{edits:{},deleted:[]}); o.deleted=[...new Set([...(o.deleted||[]),row.key])]; jset('sm_ov_vehicles',o); setRev(x=>x+1); return;} const isLocal=await mutate('vehicles','DELETE',row.key,undefined,row.remoteId); setLocal(isLocal); setRev(x=>x+1);}
+
+    // Layer 1: from dedicated /api/vehicles endpoint
+    (vehiclesLoad.data || []).forEach(v => {
+      const key = v.registration_no || v.registration || v.vehicle_id;
+      m.set(key, {
+        trips: 0, active: false, next: false,
+        ...v,
+        key,
+        reg: v.registration_no || v.registration || key,
+        seats: Number(v.seat_capacity || v.seats || 0),
+        vehicle_type: v.vehicle_type || v.type,
+        id: v.vehicle_id,
+        remoteId: v.vehicle_id,
+      });
+    });
+
+    // Layer 2: trip counts
+    (sample.data || []).forEach(t => {
+      if (!t.vehicle_registration) return;
+      const key = t.vehicle_registration;
+      const v = m.get(key) || { key, reg: key, seats: t.seat_capacity, trips: 0, active: false, next: false };
+      v.trips = (v.trips || 0) + 1;
+      const st = String(t.status).toUpperCase();
+      if (st === 'IN_PROGRESS') v.active = true;
+      if (st === 'SCHEDULED') v.next = true;
+      m.set(key, v);
+    });
+
+    // Layer 3: ratings from top_vehicles
+    (top.data?.top_vehicles || []).forEach(r => {
+      const key = r.registration_no || r.registration || r.reg;
+      const v = m.get(key) || { key, reg: key, seats: r.seat_capacity || r.seats, trips: 0, active: false, next: false };
+      Object.assign(v, { id: r.vehicle_id, remoteId: r.vehicle_id, rating: r.avg_rating });
+      m.set(key, v);
+    });
+
+    // Layer 4: local-only rows (saved while offline)
+    newRows('vehicles').forEach(r => {
+      const key = r.key || r.registration_no || r.registration || r.reg || r.id;
+      if (!m.has(key)) {
+        m.set(key, { trips: 0, active: false, next: false, status: 'Idle', ...r, key, reg: r.reg || r.registration || r.registration_no || key, seats: Number(r.seats || r.seat_capacity || 0) });
+      }
+    });
+
+    // Convert Oracle DB status values to display labels
+    const vehicleDisplayStatus = (v) => {
+      if (v.active) return 'In service';
+      if (v.next) return 'Scheduled';
+      const s = String(v.status || '').toUpperCase();
+      if (s === 'UNDER_MAINTENANCE' || s === 'UNDER MAINTENANCE') return 'Maintenance';
+      if (s === 'RETIRED') return 'Retired';
+      if (s === 'ACTIVE') return 'Idle';
+      return v.status || 'Idle';
+    };
+
+    // API is source of truth — no overlay filtering needed
+    return [...m.values()]
+      .map(v => ({ ...v, status: vehicleDisplayStatus(v) }))
+      .filter(v => String(v.reg).toLowerCase().includes(q.toLowerCase()));
+  }, [vehiclesLoad.data, sample.data, top.data, q]);
+
+  const stTone = { 'In service': 'blue', Scheduled: 'warn', Idle: 'ok', Maintenance: 'bad' };
+
+  async function add(body) {
+    const key = body.reg;
+    const vtype = body.vehicle_type || body.type || (Number(body.seats) >= 20 ? 'BUS' : 'VAN');
+    // Do NOT send vehicle_id from frontend — let backend auto-generate a valid VARCHAR2(10) ID
+    const result = await createResource('vehicles', {
+      ...body,
+      registration_no: body.reg,
+      registration: body.reg,
+      vehicle_type: vtype,
+      type: vtype,
+      seat_capacity: Number(body.seats),
+      seats: Number(body.seats)
+    }, () => ({
+      ...body,
+      key,
+      id: key,
+      vehicle_id: key,
+      registration_no: body.reg,
+      registration: body.reg,
+      vehicle_type: vtype,
+      type: vtype,
+      seat_capacity: Number(body.seats),
+      seats: Number(body.seats),
+      reg: body.reg,
+      localOnly: true
+    }));
+    setLocal(result.local);
+    setRefresh(x => x + 1); // re-fetch from API
+  }
+
+  async function del(row) {
+    if (row.localOnly || newRows('vehicles').some(r => (r.key || r.registration_no || r.registration || r.reg || r.id) === row.key)) {
+      removeNewRow('vehicles', r => (r.key || r.registration_no || r.registration || r.reg || r.id) === row.key);
+      const o = jget('sm_ov_vehicles', { edits: {}, deleted: [] });
+      o.deleted = [...new Set([...(o.deleted || []), row.key])];
+      jset('sm_ov_vehicles', o);
+      setRefresh(x => x + 1);
+      return;
+    }
+    const isLocal = await mutate('vehicles', 'DELETE', row.key, undefined, row.remoteId);
+    setLocal(isLocal);
+    setRefresh(x => x + 1);
+  }
+
+  const loading = vehiclesLoad.loading;
+  const error = vehiclesLoad.error || sample.error;
+
   return <>
     <Head title="Vehicles">Manage registrations, capacity, service status and fleet availability.</Head>
-    <div className="tools"><input className="search" aria-label="Search vehicles" placeholder="Search registration" value={q} onChange={e=>setQ(e.target.value)} /><button className="btn primary" type="button" onClick={()=>setDlg({mode:'create',row:{status:'Idle',seats:12}})}>+ Add vehicle</button></div>
+    <div className="tools">
+      <input className="search" aria-label="Search vehicles" placeholder="Search registration" value={q} onChange={e => setQ(e.target.value)} />
+      <button className="btn primary" type="button" onClick={() => setDlg({ mode: 'create', row: { status: 'Idle', seats: 12, vehicle_type: 'VAN' } })}>+ Add vehicle</button>
+    </div>
     <LocalNote on={local} res="vehicles" />
-    {sample.error && <ErrorMessage message={sample.error} />}
-    {!sample.loading && !list.length && !sample.error && <div className="empty">No vehicles yet. Use <b>+ Add vehicle</b> to create the first vehicle.</div>}
-    {!!list.length && <section className="card tbl"><table><thead><tr><th>Registration</th><th>Type</th><th>Seats</th><th>Status</th><th>Trips</th><th>Per km</th><th>Rating</th><th>Actions</th></tr></thead><tbody>{list.map(v=>{const t=vType(v.seats);return <tr key={v.key}><td><b>{v.reg}</b></td><td>{t==='BUS'?'Bus':'Van'}</td><td>{v.seats}</td><td><span className={`tag ${stTone[v.status]||''}`}>{v.status}</span></td><td>{v.trips}</td><td>{lkr(rates[t])}</td><td>{v.rating?Number(v.rating).toFixed(1):'-'}</td><RowActions onEdit={()=>setDlg({mode:'edit',row:{...v,reg:v.reg,seats:v.seats,label:v.reg}})} onDelete={()=>setDlg({mode:'delete',row:{...v,label:v.reg}})} /></tr>})}</tbody></table></section>}
-    {dlg && <ResourceDialog noun="vehicle" mode={dlg.mode} row={dlg.row} fields={[{name:'reg',label:'Registration',placeholder:'e.g. WP CAA-1234'},{name:'seats',label:'Seat capacity',type:'number',placeholder:'12'},{name:'status',label:'Status',options:['Idle','In service','Scheduled','Maintenance']}]} onClose={()=>setDlg(null)} onSubmit={async body=>{ if(dlg.mode==='create') await add(body); else { const l=await mutate('vehicles','PUT',dlg.row.key,{...body,registration_no:body.reg,seat_capacity:Number(body.seats)},dlg.row.remoteId); setLocal(l); setRev(x=>x+1); } }} onDelete={()=>del(dlg.row)} />}
+    {error && <ErrorMessage message={error} />}
+    {loading && <div className="empty">Loading vehicles...</div>}
+    {!loading && !list.length && !error && <div className="empty">No vehicles yet. Use <b>+ Add vehicle</b> to create the first vehicle.</div>}
+    {!loading && !!list.length && <section className="card tbl"><table><thead><tr><th>Registration</th><th>Type</th><th>Seats</th><th>Status</th><th>Trips</th><th>Per km</th><th>Rating</th><th>Actions</th></tr></thead><tbody>{list.map(v => { const t = v.vehicle_type || v.type || vType(v.seats); return <tr key={v.key}><td><b>{v.reg}</b></td><td>{t === 'BUS' ? 'Bus' : 'Van'}</td><td>{v.seats}</td><td><span className={`tag ${stTone[v.status] || ''}`}>{v.status}</span></td><td>{v.trips}</td><td>{lkr(rates[t])}</td><td>{v.rating ? Number(v.rating).toFixed(1) : '-'}</td><RowActions onEdit={() => setDlg({ mode: 'edit', row: { ...v, reg: v.reg, seats: v.seats, vehicle_type: t, label: v.reg } })} onDelete={() => setDlg({ mode: 'delete', row: { ...v, label: v.reg } })} /></tr>; })}</tbody></table></section>}
+    {dlg && <ResourceDialog noun="vehicle" mode={dlg.mode} row={dlg.row} fields={[{ name: 'reg', label: 'Registration', placeholder: 'e.g. WP CAA-1234' }, { name: 'seats', label: 'Seat capacity', type: 'number', placeholder: '12' }, { name: 'vehicle_type', label: 'Vehicle type', options: ['VAN', 'BUS'] }, { name: 'status', label: 'Status', options: ['Idle', 'In service', 'Scheduled', 'Maintenance'] }]} onClose={() => setDlg(null)} onSubmit={async body => { const vtype = body.vehicle_type || body.type || (Number(body.seats) >= 20 ? 'BUS' : 'VAN'); if (dlg.mode === 'create') await add(body); else { const l = await mutate('vehicles', 'PUT', dlg.row.key, { ...body, registration_no: body.reg, vehicle_type: vtype, type: vtype, seat_capacity: Number(body.seats) }, dlg.row.remoteId); setLocal(l); setRefresh(x => x + 1); } }} onDelete={() => del(dlg.row)} />}
   </>;
 }
 

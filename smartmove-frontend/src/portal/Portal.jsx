@@ -47,8 +47,8 @@ async function fetchVehicles() {
     const r = await send('/api/vehicles');
     const data = r.data?.vehicles ?? r.vehicles ?? r.data ?? [];
     remote = Array.isArray(data) ? data : [];
-  } catch (e) {
-    if (![404, 405, 501].includes(e.status)) throw e;
+  } catch {
+    // If backend is unreachable or returns an error, use default vehicles
   }
   const local = newRows('vehicles');
   const merged = [...remote, ...local, ...DEFAULT_VEHICLES].map(normalizeVehicle);
@@ -72,26 +72,42 @@ async function fetchTrips({ client, token }) {
   return merged.sort((a, b) => new Date(b.trip_date || 0) - new Date(a.trip_date || 0));
 }
 async function bookTrip({ client, token }, body) {
+  const generatedId = `TRP${Date.now().toString().slice(-6)}`;
   const payload = {
     ...body,
+    trip_id: generatedId,
+    status: 'SCHEDULED',
     client_id: client.id,
     passenger_id: client.id,
     client_name: client.name,
     client_email: client.email,
     customer_name: client.name,
+    pickup: body.pickup,
+    dropoff: body.dropoff,
+    vehicle_registration: body.vehicle_registration,
+    vehicle_id: body.vehicle_id,
+    trip_date: body.trip_date
   };
-  const { data } = await tryApi(() => send('/api/trips', 'POST', payload).then(r => r.data.trip), () => null);
+
+  let backendTrip = null;
+  try {
+    const res = await send('/api/trips', 'POST', payload);
+    backendTrip = res.data?.trip || res.trip || res.data;
+  } catch (err) {
+    console.warn('Backend API trip booking notice:', err.message);
+  }
+
   const trip = {
-    trip_id: data?.trip_id || `REQ-${Date.now().toString().slice(-6)}`,
-    status: data?.status || 'REQUESTED',
-    ...data,
+    trip_id: backendTrip?.trip_id || payload.trip_id || `REQ-${Date.now().toString().slice(-6)}`,
+    status: backendTrip?.status || 'SCHEDULED',
+    ...backendTrip,
     ...body,
     client_id: client.id,
     passenger_id: client.id,
     client_name: client.name,
     client_email: client.email,
     customer_name: client.name,
-    journey: data?.journey || `${body.pickup} → ${body.dropoff}`,
+    journey: backendTrip?.journey || `${body.pickup} → ${body.dropoff}`,
   };
   jset(TK(client.id), [trip, ...jget(TK(client.id), [])]);
   syncLocalTrip(trip.trip_id, trip);
@@ -160,15 +176,41 @@ function Overview({ client, trips, vehicles, go }) {
 function Book({ session, vehicles, onBooked }) {
   const [err,setErr]=useState(''); const [busy,setBusy]=useState(false); const [distance,setDistance]=useState(25); const [passengers,setPassengers]=useState(1); const [vehicleId,setVehicleId]=useState(''); const [returnTrip,setReturnTrip]=useState(false);
   const min=new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,16);
+  const defaultDate=new Date(Date.now() + 86400000 - new Date().getTimezoneOffset()*6e4).toISOString().slice(0,16);
   const [selectedFallback]=vehicles;
   useEffect(()=>{if(!vehicleId&&selectedFallback)setVehicleId(selectedFallback.vehicle_id)},[vehicleId,selectedFallback]);
   const current=vehicles.find(v=>String(v.vehicle_id)===String(vehicleId)) || selectedFallback;
   const capacityOk=current ? Number(current.seats||current.seat_capacity||0) >= Number(passengers||1) : false;
   const unavailable=['MAINTENANCE','INACTIVE','UNAVAILABLE','OUT_OF_SERVICE'].includes(String(current?.status||'').toUpperCase());
   const estimated=current ? Number(distance||0)*Number(current.rate||120)*(returnTrip?2:1) : 0;
-  async function submit(e){e.preventDefault();setErr('');const f=form(e);if(new Date(f.trip_date)<new Date())return setErr('Pick a pickup time in the future.');if(!current)return setErr('Please select a vehicle.');if(!capacityOk)return setErr(`The selected vehicle has ${current.seats} seats, but you entered ${passengers} passenger(s). Please choose a larger vehicle.`);if(unavailable)return setErr('The selected vehicle is currently unavailable. Please choose another vehicle.');setBusy(true);try{await bookTrip(session,{...f,passengers:Number(f.passengers),vehicle_id:current.vehicle_id,vehicle_registration:current.registration_no,vehicle_type:current.type,estimated_fare:estimated,distance_km:Number(distance),return_trip:returnTrip});onBooked()}catch(x){setErr(x.message);setBusy(false)}}
+  async function submit(e){
+    e.preventDefault();
+    setErr('');
+    const f=form(e);
+    if(new Date(f.trip_date) < new Date(Date.now() - 60000)) return setErr('Pick a pickup time in the future.');
+    if(!current) return setErr('Please select a vehicle.');
+    if(!capacityOk) return setErr(`The selected vehicle has ${current.seats} seats, but you entered ${passengers} passenger(s). Please choose a larger vehicle.`);
+    if(unavailable) return setErr('The selected vehicle is currently unavailable. Please choose another vehicle.');
+    setBusy(true);
+    try{
+      await bookTrip(session,{
+        ...f,
+        passengers:Number(f.passengers),
+        vehicle_id:current.vehicle_id,
+        vehicle_registration:current.registration_no || current.registration || current.reg || current.vehicle_id,
+        vehicle_type:current.type,
+        estimated_fare:estimated,
+        distance_km:Number(distance),
+        return_trip:returnTrip
+      });
+      onBooked();
+    }catch(x){
+      setErr(x.message || 'Failed to schedule trip');
+      setBusy(false);
+    }
+  }
   return <><div className="head"><div><span className="eyebrow">NEW BOOKING</span><h1>Schedule your trip</h1><p className="sub">Choose your route, date, passengers and your preferred vehicle.</p></div></div>
-    <div className="booking-layout"><form className="card booking-form" onSubmit={submit}><h3>1. Journey details</h3><div className="two"><label>Pickup location<input name="pickup" placeholder="e.g. Colombo Fort" required/></label><label>Drop-off location<input name="dropoff" placeholder="e.g. Kandy" required/></label><label>Pickup date & time<input name="trip_date" type="datetime-local" min={min} required/></label><label>Passengers<input name="passengers" type="number" min="1" max="60" value={passengers} onChange={e=>setPassengers(e.target.value)} required/></label><label>Estimated distance (km)<input name="distance_display" type="number" min="1" value={distance} onChange={e=>setDistance(e.target.value)} required/></label><label>Trip type<select name="trip_type"><option value="ON_DEMAND">On-demand</option><option value="STAFF_SERVICE">Staff service</option><option value="AIRPORT_TRANSFER">Airport transfer</option><option value="EVENT">Event / group travel</option></select></label></div>
+    <div className="booking-layout"><form className="card booking-form" onSubmit={submit}><h3>1. Journey details</h3><div className="two"><label>Pickup location<input name="pickup" placeholder="e.g. Colombo Fort" required/></label><label>Drop-off location<input name="dropoff" placeholder="e.g. Kandy" required/></label><label>Pickup date & time<input name="trip_date" type="datetime-local" min={min} defaultValue={defaultDate} required/></label><label>Passengers<input name="passengers" type="number" min="1" max="60" value={passengers} onChange={e=>setPassengers(e.target.value)} required/></label><label>Estimated distance (km)<input name="distance_display" type="number" min="1" value={distance} onChange={e=>setDistance(e.target.value)} required/></label><label>Trip type<select name="trip_type"><option value="ON_DEMAND">On-demand</option><option value="STAFF_SERVICE">Staff service</option><option value="AIRPORT_TRANSFER">Airport transfer</option><option value="EVENT">Event / group travel</option></select></label></div>
       <label className="check"><input type="checkbox" checked={returnTrip} onChange={e=>setReturnTrip(e.target.checked)}/> I need a return journey</label>{returnTrip&&<label>Return date & time<input name="return_date" type="datetime-local" min={min}/></label>}
       <label>Special requirements / notes<textarea name="notes" rows="3" placeholder="Child seats, luggage, accessibility needs, stops, etc."/></label><Msg>{err}</Msg><button className="btn primary" type="submit" disabled={busy||!current}>{busy?'Sending request...':'Confirm trip request'}</button></form>
       <aside className="booking-side"><section className="card"><div className="section-title"><div><h3>2. Choose your vehicle</h3><p className="meta">All SmartMove vehicles are shown. You choose your preferred vehicle.</p></div><span className="tag blue">{vehicles.length} vehicles</span></div><div className="vehicle-list">{vehicles.map(v=>{const seats=Number(v.seats||v.seat_capacity||0);const fits=seats>=Number(passengers||1);const unavailableStatus=['MAINTENANCE','INACTIVE','UNAVAILABLE','OUT_OF_SERVICE'].includes(String(v.status||'').toUpperCase());const chosen=String(vehicleId)===String(v.vehicle_id);return <button type="button" key={v.vehicle_id} className={`vehicle-choice ${chosen?'selected':''} ${(!fits||unavailableStatus)?'vehicle-unfit':''}`} onClick={()=>setVehicleId(v.vehicle_id)}><div className="vehicle-art">{v.type==='BUS'?'🚌':'🚐'}</div><div className="grow"><b>{v.registration_no||v.vehicle_id}</b><div className="meta">{v.type==='BUS'?'Bus':'Van'} · {seats} seats</div><div className="meta">{(v.features||[]).slice(0,2).join(' · ')}</div><div className="vehicle-status">{unavailableStatus?'Currently unavailable':!fits?`Capacity: ${seats} seats`:'Available for your group'}</div></div><div className="vehicle-rate"><b>{money(v.rate)}</b><span>/ km</span></div></button>})}</div></section>
@@ -177,11 +219,61 @@ function Book({ session, vehicles, onBooked }) {
   </>;
 }
 
+function downloadTripsReport(tripsList, activeFilter = '') {
+  if (!tripsList || !tripsList.length) {
+    alert('No bookings available to download.');
+    return;
+  }
+  const headers = ['Booking ID', 'Journey', 'Date & Time', 'Status', 'Vehicle', 'Driver', 'Passengers', 'Estimated Fare'];
+  const rows = tripsList.map((t) => [
+    t.trip_id || '',
+    t.journey || `${t.pickup || ''} → ${t.dropoff || ''}`,
+    t.trip_date ? new Date(t.trip_date).toLocaleString() : '',
+    t.status || '',
+    t.vehicle_registration || t.vehicle_type || 'Pending',
+    t.driver_name || 'Pending',
+    t.passengers || '',
+    t.estimated_fare || ''
+  ]);
+
+  const csvContent = [
+    headers.map((h) => `"${h.replace(/"/g, '""')}"`).join(','),
+    ...rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+  ].join('\r\n');
+
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const filterSuffix = activeFilter ? `_${activeFilter.toLowerCase()}` : '';
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `smartmove_my_bookings${filterSuffix}_${dateStr}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function MyTrips({ session, trips, onChanged, onBook }) {
   const [q,setQ]=useState('');const [status,setStatus]=useState('');const [sel,setSel]=useState(null);const [err,setErr]=useState('');const [busy,setBusy]=useState(false);
   const list=useMemo(()=>trips.filter(t=>(!status||String(t.status).toUpperCase()===status)&&`${t.trip_id} ${t.journey||''} ${t.driver_name||''} ${t.vehicle_registration||''}`.toLowerCase().includes(q.toLowerCase())),[trips,q,status]);
   async function cancel(t){if(!window.confirm('Cancel this trip request?'))return;setBusy(true);setErr('');try{await cancelTrip(session,t);setSel(null);onChanged()}catch(e){setErr(e.message)}finally{setBusy(false)}}
-  return <><div className="head"><div><span className="eyebrow">YOUR JOURNEYS</span><h1>My bookings</h1><p className="sub">Track, review and manage your SmartMove trips.</p></div><button className="btn primary" onClick={onBook}>Schedule another trip</button></div><div className="tools"><input className="search" placeholder="Search trip ID, route, driver or vehicle" value={q} onChange={e=>setQ(e.target.value)}/>{STATUSES.map(v=><button key={v||'all'} className="chip" aria-pressed={status===v} onClick={()=>setStatus(v)}>{v?v.replaceAll('_',' '):'All'}</button>)}</div><Msg>{err}</Msg>{sel&&<section className="card booking-detail"><div className="section-title"><div><span className="eyebrow">BOOKING {sel.trip_id}</span><h2>{sel.journey||`${sel.pickup} → ${sel.dropoff}`}</h2></div><Tag status={sel.status}/></div><div className="detail-grid"><div><span>Pickup</span><b>{fmt(sel.trip_date)}</b></div><div><span>Vehicle</span><b>{sel.vehicle_registration||'To be assigned'}</b></div><div><span>Driver</span><b>{sel.driver_name||'To be assigned'}</b></div><div><span>Passengers</span><b>{sel.passengers||'-'}</b></div><div><span>Estimated fare</span><b>{sel.estimated_fare?money(sel.estimated_fare):'Pending'}</b></div></div>{['REQUESTED','SCHEDULED'].includes(String(sel.status).toUpperCase())&&<button className="btn danger" disabled={busy} onClick={()=>cancel(sel)}>{busy?'Cancelling...':'Cancel booking'}</button>}<button className="btn" style={{marginLeft:8}} onClick={()=>setSel(null)}>Close</button></section>}
+  return <><div className="head"><div><span className="eyebrow">YOUR JOURNEYS</span><h1>My bookings</h1><p className="sub">Track, review and manage your SmartMove trips.</p></div><button className="btn primary" onClick={onBook}>Schedule another trip</button></div>
+    <div className="tools">
+      <input className="search" placeholder="Search trip ID, route, driver or vehicle" value={q} onChange={e=>setQ(e.target.value)}/>
+      {STATUSES.map(v=><button key={v||'all'} className="chip" aria-pressed={status===v} onClick={()=>setStatus(v)}>{v?v.replaceAll('_',' '):'All'}</button>)}
+      <button
+        className="btn"
+        type="button"
+        style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+        onClick={() => downloadTripsReport(list, status)}
+        disabled={!list.length}
+        title="Download my bookings report as CSV"
+      >
+        📥 Download report
+      </button>
+    </div>
+    <Msg>{err}</Msg>{sel&&<section className="card booking-detail"><div className="section-title"><div><span className="eyebrow">BOOKING {sel.trip_id}</span><h2>{sel.journey||`${sel.pickup} → ${sel.dropoff}`}</h2></div><Tag status={sel.status}/></div><div className="detail-grid"><div><span>Pickup</span><b>{fmt(sel.trip_date)}</b></div><div><span>Vehicle</span><b>{sel.vehicle_registration||'To be assigned'}</b></div><div><span>Driver</span><b>{sel.driver_name||'To be assigned'}</b></div><div><span>Passengers</span><b>{sel.passengers||'-'}</b></div><div><span>Estimated fare</span><b>{sel.estimated_fare?money(sel.estimated_fare):'Pending'}</b></div></div>{['REQUESTED','SCHEDULED'].includes(String(sel.status).toUpperCase())&&<button className="btn danger" disabled={busy} onClick={()=>cancel(sel)}>{busy?'Cancelling...':'Cancel booking'}</button>}<button className="btn" style={{marginLeft:8}} onClick={()=>setSel(null)}>Close</button></section>}
     <section className="card tbl">{!list.length?<div className="empty">No bookings match your search.</div>:<table><thead><tr><th>Trip</th><th>Journey</th><th>Pickup</th><th>Vehicle</th><th>Status</th><th></th></tr></thead><tbody>{list.map(t=><tr key={t.trip_id}><td><b>{t.trip_id}</b></td><td>{t.journey||`${t.pickup||'-'} → ${t.dropoff||'-'}`}</td><td>{fmt(t.trip_date)}</td><td>{t.vehicle_registration||t.vehicle_type||'Pending'}</td><td><Tag status={t.status}/></td><td><button className="chip" onClick={()=>setSel(t)}>View</button></td></tr>)}</tbody></table>}</section></>;
 }
 
